@@ -37,4 +37,22 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    """Evaluate a tool-call context, failing closed for invalid metadata."""
+    valid_classifications = {"public", "internal", "restricted"}
+
+    if context.data_classification not in valid_classifications:
+        return False, f"deny: unknown data classification {context.data_classification!r}"
+    if not context.request_purpose.strip():
+        return False, "deny: request purpose is required"
+    if not context.agent_owner.strip():
+        return False, "deny: agent owner identity is required"
+    if context.delegation_depth < 0:
+        return False, "deny: delegation depth cannot be negative"
+
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "deny: restricted data cannot be used by an egress-enabled run"
+
+    return (
+        True,
+        "allow: context is valid and does not combine restricted data with egress",
+    )
