@@ -53,11 +53,145 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent import ledger, tools
+from agent.policy import PolicyContext, check
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+_TICKET_FILE_RE = re.compile(r"^ticket-(\d+)(?:b)?\.md$", re.IGNORECASE)
+_AGENT_TTL = timedelta(minutes=15)
+
+
+def _args_hash(args: dict) -> str:
+    encoded = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _policy_tool_call(
+    *,
+    tool_name: str,
+    args: dict,
+    context: PolicyContext,
+    run_id: str,
+    ledger_path: Path,
+    execute,
+):
+    allow, reason = check(context)
+    now = datetime.now(timezone.utc)
+    ledger.append(
+        {
+            "ts": now.isoformat(),
+            "agent_id": context.agent_owner,
+            "agent_owner": context.agent_owner,
+            "run_id": run_id,
+            "expires_at": (now + _AGENT_TTL).isoformat(),
+            "tool": tool_name,
+            "args_hash": _args_hash(args),
+            "classification": context.data_classification,
+            "decision": "allow" if allow else "deny",
+            "reason": reason,
+        },
+        ledger_path,
+    )
+    if not allow:
+        return None
+    return execute()
+
+
+def _ticket_ids_from_docs(docs: list[dict]) -> tuple[int, ...]:
+    """Return only typed IDs derived from trusted filename metadata."""
+    ticket_ids = set()
+    for doc in docs:
+        match = _TICKET_FILE_RE.fullmatch(str(doc.get("id", "")))
+        if match:
+            ticket_ids.add(int(match.group(1)))
+    return tuple(sorted(ticket_ids))
+
+
+def _customer_ids_for_tickets(ticket_ids: tuple[int, ...]) -> tuple[str, ...]:
+    """Map typed ticket IDs to customers using the trusted relationship store."""
+    requested = set(ticket_ids)
+    customers = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    return tuple(
+        str(customer["customer_id"])
+        for customer in customers
+        if requested.intersection(int(value) for value in customer.get("related_tickets", []))
+    )
+
+
+def _run_private(ticket_ids: tuple[int, ...], ledger_path: Path, request_id: str) -> list[dict]:
+    """Run B receives typed IDs only; document free text cannot cross this boundary."""
+    run_id = f"{request_id}:private"
+    context = PolicyContext(
+        data_classification="restricted",
+        request_purpose="support-ticket-resolution",
+        agent_owner="lab24-private-agent",
+        delegation_depth=1,
+        egress_enabled=False,
+    )
+    records = []
+    for customer_id in _customer_ids_for_tickets(ticket_ids):
+        record = _policy_tool_call(
+            tool_name="read_customer",
+            args={"customer_id": customer_id},
+            context=context,
+            run_id=run_id,
+            ledger_path=ledger_path,
+            execute=lambda customer_id=customer_id: tools.read_customer(customer_id),
+        )
+        if record is not None:
+            records.append(record)
+    return records
 
 
 def handle(message: str, llm, log_dir: Path | None = None) -> str:
-    raise NotImplementedError("BƯỚC 3c: implement trifecta split")
+    ledger_path = (Path(log_dir) / "ledger.jsonl") if log_dir is not None else DEFAULT_LEDGER_PATH
+    request_id = uuid.uuid4().hex
+    search_context = PolicyContext(
+        data_classification="internal",
+        request_purpose="summarize-tickets",
+        agent_owner="lab24-search-agent",
+        delegation_depth=0,
+        egress_enabled=False,
+    )
+    docs = _policy_tool_call(
+        tool_name="search_docs",
+        args={"query": message},
+        context=search_context,
+        run_id=f"{request_id}:search",
+        ledger_path=ledger_path,
+        execute=lambda: tools.search_docs(message),
+    )
+    if docs is None:
+        return "Yêu cầu tìm kiếm bị policy từ chối."
+
+    combined_text = "\n\n".join(doc["text"] for doc in docs)
+    injected = llm.find_injection(combined_text)
+    ticket_ids = _ticket_ids_from_docs(docs)
+    _run_private(ticket_ids, ledger_path, request_id)
+
+    if injected is not None:
+        egress_context = PolicyContext(
+            data_classification="restricted",
+            request_purpose="instruction-from-untrusted-document",
+            agent_owner="lab24-egress-agent",
+            delegation_depth=1,
+            egress_enabled=True,
+        )
+        _policy_tool_call(
+            tool_name="http_post",
+            args={"url": injected.target_url, "record_count": 0},
+            context=egress_context,
+            run_id=f"{request_id}:egress",
+            ledger_path=ledger_path,
+            execute=lambda: tools.http_post(injected.target_url, {"records": []}),
+        )
+
+    return llm.summarize(docs)
